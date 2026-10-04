@@ -14,6 +14,16 @@ curl -s "$BASE/permissions/check?version_id=demo-derived-1&use=research&at=2026-
 say "判定示例：2026-07-01 申请 review（被 demo-root-a 阻断）"
 curl -s "$BASE/permissions/check?version_id=demo-derived-1&use=review&at=2026-07-01T00:00:00Z"; echo
 
+say "使用期时间线：demo-derived-1 在 2026 全年申请 review（交集仅 research，6 月起 a 也阻断）"
+curl -s "$BASE/permissions/timeline?version_id=demo-derived-1&use=review&start=2026-01-01T00:00:00Z&end=2027-01-01T00:00:00Z" | python3 -m json.tool 2>/dev/null || true
+
+say "使用期时间线：research 全年（持续允许，但 6 月依据变更 -> 两段相邻允许片段）"
+curl -s "$BASE/permissions/timeline?version_id=demo-derived-1&use=research&start=2026-02-01T00:00:00Z&end=2027-01-01T00:00:00Z"; echo
+
+say "使用期时间线：无时区时间 -> 422；开始不早于结束 -> 422 invalid_range"
+curl -s -o /dev/null -w "naive -> %{http_code}\n" "$BASE/permissions/timeline?version_id=demo-derived-1&use=research&start=2026-01-01T00:00:00&end=2026-02-01T00:00:00Z"
+curl -s "$BASE/permissions/timeline?version_id=demo-derived-1&use=research&start=2026-02-01T00:00:00Z&end=2026-01-01T00:00:00Z"; echo
+
 say "登记新派生版本（父版本 demo-root-a）"
 curl -s -X POST "$BASE/versions" -H 'Content-Type: application/json' \
   -d '{"version_id":"example-v1","parent_ids":["demo-root-a"],"note":"调用示例"}'; echo

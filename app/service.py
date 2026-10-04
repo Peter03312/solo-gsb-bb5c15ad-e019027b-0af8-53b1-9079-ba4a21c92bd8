@@ -75,6 +75,11 @@ class InvalidTimeError(ServiceError):
     code = "invalid_time"
 
 
+class InvalidRangeError(ServiceError):
+    status_code = 422
+    code = "invalid_range"
+
+
 # -- serialisation ---------------------------------------------------------
 
 
@@ -340,6 +345,93 @@ class LicenseService:
             "allowed_uses_intersection": result_intersection,
         }
 
+    # -- usage-period timeline --------------------------------------------
+
+    def permission_timeline(
+        self, version_id: str, use: str, start: datetime, end: datetime
+    ) -> dict[str, Any]:
+        """Split the half-open interval ``[start, end)`` into maximal
+        contiguous segments during which the permission decision for ``use``
+        stays unchanged.
+
+        On one consistent snapshot the queried version and every ancestor are
+        expanded once (diamond-safe). The candidate boundaries are ``start``
+        plus every change instant strictly inside ``(start, end)`` from any
+        version in the snapshot: a change exactly at ``start`` applies
+        immediately (it is already the license at the first segment's left
+        edge), while a change exactly at ``end`` never does. Each segment is
+        evaluated at its left edge and adjacent segments whose basis or
+        blockers differ in no way are merged back together — changes of
+        unrelated versions thus never split the timeline.
+"""
+        if start.tzinfo is None or end.tzinfo is None:
+            raise InvalidTimeError("开始与结束时刻必须带时区信息")
+        use = use.strip()
+        if not use:
+            raise ServiceError("用途不能为空")
+        if start >= end:
+            raise InvalidRangeError(
+                "使用期必须为开始早于结束的非空区间（按 UTC 比较）",
+                {"start": to_canonical(start), "end": to_canonical(end)},
+            )
+
+        start_canonical = to_canonical(start)
+        end_canonical = to_canonical(end)
+
+        with self.db.lock:
+            # Existence check and snapshot capture share the same lock so an
+            # unknown version never yields a partial result and concurrent
+            # commits cannot interleave into the evaluation.
+            if self.db.get_version(version_id) is None:
+                raise NotFoundError("版本不存在", {"version_id": version_id})
+            snapshot = self._capture_snapshot()
+
+        closure = snapshot.closure_from(version_id)
+
+        # Candidate boundaries: every in-force change instant strictly inside
+        # the interval, from any version in the snapshot. Adjacent segments
+        # are merged afterwards, so unrelated changes cost nothing in output.
+        boundaries: set[str] = {start_canonical}
+        for changes in snapshot.changes.values():
+            for change in changes:
+                if change.effective_at >= end_canonical:
+                    break  # changes lists are time-sorted
+                if change.effective_at > start_canonical:
+                    boundaries.add(change.effective_at)
+        cuts = sorted(boundaries)
+        cuts.append(end_canonical)
+
+        segments: list[dict[str, Any]] = []
+        for index, left in enumerate(cuts[:-1]):
+            right = cuts[index + 1]
+            decision = _evaluate(snapshot, version_id, use, left, None)
+            segment = {
+                "start": parse_canonical(left),
+                "end": parse_canonical(right),
+                "allowed": decision["allowed"],
+                "basis": decision["basis"],
+                "blockers": decision["blockers"],
+                "allowed_uses_intersection": decision["allowed_uses_intersection"],
+                "_signature": _segment_signature(closure, decision),
+            }
+            if segments and segments[-1]["_signature"] == segment["_signature"]:
+                # Only the decision basis or blocker information may split
+                # segments; identical neighbouring pieces are joined.
+                segments[-1]["end"] = segment["end"]
+            else:
+                segments.append(segment)
+        for segment in segments:
+            segment.pop("_signature")
+
+        return {
+            "version_id": version_id,
+            "use": use,
+            "start": start.astimezone(timezone.utc),
+            "end": end.astimezone(timezone.utc),
+            "closure": closure,
+            "segments": segments,
+        }
+
     # -- change preview (no writes) ---------------------------------------
 
     def preview_change(
@@ -580,6 +672,35 @@ class Snapshot:
         if stored is not None and stored.effective_at > override.effective_at:
             return stored
         return override
+
+
+def _segment_signature(
+    closure: list[str], decision: dict[str, Any]
+) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+    """Identity of a segment's decision: its basis and its blocker information.
+
+    Two neighbouring pieces of time are the same segment exactly when neither
+    the effective change of any closure version (``basis``) nor the set of
+    blocking versions and their reasons (``blockers``) differs. Closure order
+    is fixed for the whole timeline; versions without a valid license are
+    absent from the basis and recorded only through their blocker.
+    """
+    basis_by_version = {
+        entry["version_id"]: entry["change_id"] for entry in decision["basis"]
+    }
+    blockers_by_version = {
+        entry["version_id"]: (entry["reason"], entry.get("change_id"))
+        for entry in decision["blockers"]
+    }
+    basis_key = tuple(
+        (vid, basis_by_version.get(vid)) for vid in closure
+    )
+    blocker_key = tuple(
+        (vid, blockers_by_version[vid][0], blockers_by_version[vid][1])
+        for vid in closure
+        if vid in blockers_by_version
+    )
+    return basis_key, blocker_key
 
 
 def _evaluate(

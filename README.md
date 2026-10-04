@@ -12,6 +12,11 @@
   3. 对各版本的允许用途取**交集**；
   4. **任一版本在该时刻没有有效许可，或其有效许可不包含所申请用途，即拒绝**；
   5. 响应返回：`allowed` 可否使用、`basis` 各版本所依据的变更、`blockers` 所有阻断版本（含原因）、`allowed_uses_intersection` 交集。
+- **使用期分段（时间线）**：查询「给定版本 + 用途 + 半开区间 `[start, end)`」时，服务在**一次一致数据视图**中沿固定父引用展开自身及全部祖先（菱形祖先只计一次），收集区间内全部许可变更生效时刻作为候选切点，逐段按「各版本当时最近生效的许可变更及用途交集」判定，并将半开区间切成**连续、无重叠**的片段：
+  1. **起点恰逢变更立即采用新许可**（变更在 `start` 即生效，归入第一段）；**终点上的变更不计入**（恰在 `end` 生效的变更不属于任何片段）；
+  2. 每段返回 `start` / `end`（半开）、`allowed`、`basis` 依据变更、`blockers` 全部阻断版本及原因、`allowed_uses_intersection`；
+  3. **仅在判定依据或阻断信息变化时才分段**——即使允许状态不变，所依据变更发生变化也会分段；相邻完全相同（依据与阻断均无差异）的片段自动**合并**，因此闭包外版本的变更不会切开时间线；
+  4. **无有效许可持续拒绝**：某段内任一版本无有效许可即以 `no_valid_license` 阻断，全部阻断版本都会列出。
 - **变更预演（不写入）**：提交变更前可经 `POST /license-changes/preview` 预演其对目标版本及全部后代的影响；同一数据快照下分别计算现状与假设提交后的判定，仅返回允许状态翻转的版本（含前后判定与阻断原因），菱形继承的后代只计一次；查询早于生效时刻、或已有更晚有效变更覆盖时结果为空且绝不误报；预演不写入任何数据，冲突/幂等语义与提交接口一致。
 - **幂等与冲突**：
   - 相同**变更标识**且语义内容（版本、生效时刻、允许用途集合；用途顺序/重复不影响）完全相同的重复提交，返回**同一结果**（HTTP `200`，`replayed=true`）；
@@ -156,7 +161,73 @@ curl -s "http://localhost:8000/permissions/check?version_id=demo-derived-1&use=r
 # -> allowed=false, blockers 含 demo-root-a / use_not_allowed
 ```
 
-### 4. 预演许可变更（提交前影响分析，不写入）
+### 4. 使用期分段（时间线）
+
+`GET /permissions/timeline?version_id=...&use=...&start=...&end=...`
+
+研究团队安排派生数据集的使用期时，经本接口一次性确认某用途在整段半开区间 `[start, end)` 内**何时可用、为何中断**。服务在单个 SQLite WAL 只读快照事务内（并在进程级锁保护下）展开版本及全部祖先、读取全部变更，评估过程中其他请求的提交不会混入。
+
+```bash
+curl -s "http://localhost:8000/permissions/timeline?version_id=demo-derived-1&use=review&start=2026-01-01T00:00:00Z&end=2027-01-01T00:00:00Z"
+```
+
+响应（字段口径与单时刻判定一致；片段连续、无重叠，恰好覆盖整个区间）：
+
+```json
+{
+  "version_id": "demo-derived-1",
+  "use": "review",
+  "start": "2026-01-01T00:00:00Z",
+  "end": "2027-01-01T00:00:00Z",
+  "closure": ["demo-derived-1", "demo-root-a", "demo-root-b"],
+  "segments": [
+    {
+      "start": "2026-01-01T00:00:00Z",
+      "end": "2026-02-01T00:00:00Z",
+      "allowed": false,
+      "basis": [],
+      "blockers": [ { "version_id": "demo-derived-1", "reason": "no_valid_license" } ],
+      "allowed_uses_intersection": []
+    },
+    {
+      "start": "2026-02-01T00:00:00Z",
+      "end": "2026-06-01T00:00:00Z",
+      "allowed": false,
+      "basis": [ { "version_id": "demo-root-b", "change_id": "demo-chg-b-1", "...": "..." } ],
+      "blockers": [ { "version_id": "demo-root-b", "reason": "use_not_allowed", "...": "..." } ],
+      "allowed_uses_intersection": ["research"]
+    },
+    {
+      "start": "2026-06-01T00:00:00Z",
+      "end": "2027-01-01T00:00:00Z",
+      "allowed": false,
+      "blockers": [
+        { "version_id": "demo-root-a", "reason": "use_not_allowed", "change_id": "demo-chg-a-2", "...": "..." },
+        { "version_id": "demo-root-b", "reason": "use_not_allowed", "change_id": "demo-chg-b-1", "...": "..." }
+      ],
+      "allowed_uses_intersection": ["research"]
+    }
+  ]
+}
+```
+
+口径要点：
+
+- **半开区间**：`[start, end)`；变更在 `start` 当刻立即生效（新许可计入首段），在 `end` 当刻生效的变更**不计入**。
+- **分段最小化**：只有某版本所依据的变更（`basis`）或阻断版本/原因（`blockers`）发生变化才另起一段。用途持续允许但依据变更更新时也会分段；相邻依据与阻断完全相同的片段合并，故闭包**之外**版本的变更不会产生切点。
+- **阻断信息完整**：`blockers` 列出该片段内**全部**阻断版本及原因（`no_valid_license` / `use_not_allowed`），菱形继承中的共享祖先只出现一次。
+- `allowed_uses_intersection` 仅在闭包内所有版本均有有效许可时有意义；存在无有效许可版本时为 `[]`。
+- 时间参数均须**带时区**（支持 `+08:00` 等偏移，服务归一化为 UTC）。
+
+错误（任一项失败均返回错误、**不返回部分片段**）：
+
+| 情形 | 结果 |
+| --- | --- |
+| 版本不存在 | `404 not_found` |
+| `start` / `end` 无时区或无法解析 | `422 invalid_time` |
+| `start >= end`（倒置或空区间） | `422 invalid_range` |
+
+### 5. 预演许可变更（提交前影响分析，不写入）
 
 `POST /license-changes/preview`
 
@@ -201,7 +272,7 @@ curl -s -X POST http://localhost:8000/license-changes/preview \
 
 并发说明：预演在单个 SQLite WAL 只读快照事务内、并在进程级锁保护下一次性读取版本、父引用与变更，评估过程中其他请求的提交不会混入，不会出现「版本来自旧快照、变更来自新快照」的拼接结果。
 
-### 5. 查询接口
+### 6. 查询接口
 
 | 方法与路径 | 说明 |
 | --- | --- |
@@ -209,6 +280,8 @@ curl -s -X POST http://localhost:8000/license-changes/preview \
 | `GET /versions` | 列出全部版本（含父引用与变更） |
 | `GET /versions/{version_id}` | 版本详情，不存在返回 `404` |
 | `GET /license-changes/{change_id}` | 按标识查询变更 |
+| `GET /permissions/check` | 单时刻判定：`version_id`、`use`、`at`（带时区） |
+| `GET /permissions/timeline` | 使用期分段：`version_id`、`use`、`start`、`end`（均带时区，半开） |
 
 错误响应统一形如：
 
@@ -246,4 +319,4 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-测试覆盖：父引用存在性与不可变、祖先展开（含菱形去重）、用途交集、无有效许可阻断、最近变更生效、幂等重放、两类 409 冲突、时区校验、示例数据初始化，以及变更预演（目标与后代翻转、查询早于生效时刻/更晚变更覆盖不误报、重放无影响、冲突与 404 错误语义、菱形后代只计一次、预演不写入、并发提交下快照不混用）。
+测试覆盖：父引用存在性与不可变、祖先展开（含菱形去重）、用途交集、无有效许可阻断、最近变更生效、幂等重放、两类 409 冲突、时区校验、示例数据初始化，变更预演（目标与后代翻转、查询早于生效时刻/更晚变更覆盖不误报、重放无影响、冲突与 404 错误语义、菱形后代只计一次、预演不写入、并发提交下快照不混用），以及使用期时间线（半开边界、起点变更立即生效/终点变更不计入、依据变化即分段、阻断变化不合段、闭包外变更被合并、菱形祖先只计一次、无时区/倒置/空区间报错且无部分结果、与单时刻判定逐段一致）。
