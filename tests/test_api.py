@@ -576,3 +576,287 @@ def test_preview_does_not_write_under_concurrent_commits(client):
     for idx in range(3):
         for i in range(25):
             assert client.get(f"/license-changes/cp-{idx}-{i}").status_code == 404
+
+
+# -- permission timeline (interval segmentation) ----------------------------
+
+
+def _timeline(client, version_id, use, start, end):
+    return client.get(
+        "/permissions/timeline",
+        params={"version_id": version_id, "use": use, "start": start, "end": end},
+    )
+
+
+def _parse_ts(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def test_timeline_segments_follow_change_boundaries(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research", "review"])
+    _change(client, "c2", "v1", _iso(2026, 6, 1), ["research"])
+
+    resp = _timeline(client, "v1", "review", _iso(2026, 3, 1), _iso(2026, 9, 1))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["version_id"] == "v1"
+    assert body["use"] == "review"
+    assert body["closure"] == ["v1"]
+
+    segments = body["segments"]
+    assert len(segments) == 2
+    first, second = segments
+
+    assert first["start"].startswith("2026-03-01T00:00:00")
+    assert first["end"].startswith("2026-06-01T00:00:00")
+    assert first["allowed"] is True
+    assert [entry["change_id"] for entry in first["basis"]] == ["c1"]
+    assert first["blockers"] == []
+    assert first["allowed_uses_intersection"] == ["research", "review"]
+
+    assert second["start"].startswith("2026-06-01T00:00:00")
+    assert second["end"].startswith("2026-09-01T00:00:00")
+    assert second["allowed"] is False
+    assert [entry["change_id"] for entry in second["basis"]] == ["c2"]
+    assert second["blockers"][0]["version_id"] == "v1"
+    assert second["blockers"][0]["reason"] == "use_not_allowed"
+    assert second["blockers"][0]["change_id"] == "c2"
+
+    # Continuous, non-overlapping coverage of the whole interval.
+    assert segments[0]["end"] == segments[1]["start"]
+
+
+def test_timeline_half_open_boundaries(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+    _change(client, "c2", "v1", _iso(2026, 3, 1), ["review"])  # exactly at start
+    _change(client, "c3", "v1", _iso(2026, 5, 1), ["research"])  # exactly at end
+
+    body = _timeline(client, "v1", "review", _iso(2026, 3, 1), _iso(2026, 5, 1)).json()
+    # The change at the start applies immediately; the one at the end is not
+    # counted, so the whole interval is a single allowed segment.
+    assert len(body["segments"]) == 1
+    segment = body["segments"][0]
+    assert segment["allowed"] is True
+    assert [entry["change_id"] for entry in segment["basis"]] == ["c2"]
+    assert segment["start"].startswith("2026-03-01T00:00:00")
+    assert segment["end"].startswith("2026-05-01T00:00:00")
+
+    # The point check at the end instant already sees c3 (half-open difference).
+    assert _check(client, "v1", "review", _iso(2026, 5, 1)).json()["allowed"] is False
+
+
+def test_timeline_no_valid_license_prefix(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 3, 1), ["research"])
+
+    body = _timeline(client, "v1", "research", _iso(2026, 1, 1), _iso(2026, 5, 1)).json()
+    assert len(body["segments"]) == 2
+    first, second = body["segments"]
+    assert first["allowed"] is False
+    assert first["basis"] == []
+    assert first["blockers"] == [
+        {"version_id": "v1", "reason": "no_valid_license", "change_id": None, "effective_at": None, "allowed_uses": []}
+    ]
+    assert first["allowed_uses_intersection"] == []
+    assert second["allowed"] is True
+    assert second["allowed_uses_intersection"] == ["research"]
+
+
+def test_timeline_diamond_closure_counted_once(client):
+    # Diamond: a <- b <- d1, a <- d1.
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research", "review"])
+    _register(client, "b", ["a"])
+    _change(client, "cb", "b", _iso(2026, 4, 1), ["research"])
+    _register(client, "d1", ["b", "a"])
+    _change(client, "cd1", "d1", _iso(2026, 1, 1), ["research", "review"])
+
+    body = _timeline(client, "d1", "research", _iso(2026, 2, 1), _iso(2026, 6, 1)).json()
+    assert body["closure"] == ["d1", "b", "a"]  # shared ancestor exactly once
+    assert len(body["segments"]) == 2
+    first, second = body["segments"]
+    # b has no license before 2026-04-01: the whole interval start is denied.
+    assert first["allowed"] is False
+    assert [(bl["version_id"], bl["reason"]) for bl in first["blockers"]] == [
+        ("b", "no_valid_license")
+    ]
+    # From 04-01 on every version in the closure allows research.
+    assert second["allowed"] is True
+    assert second["allowed_uses_intersection"] == ["research"]
+
+
+def test_timeline_reports_all_blockers_per_segment(client):
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research"])
+    _register(client, "b")
+    _change(client, "cb", "b", _iso(2026, 4, 1), ["research", "review"])
+    _register(client, "d1", ["a", "b"])
+    _change(client, "cd1", "d1", _iso(2026, 1, 1), ["research", "review"])
+
+    body = _timeline(client, "d1", "review", _iso(2026, 2, 1), _iso(2026, 6, 1)).json()
+    assert len(body["segments"]) == 2
+    first, second = body["segments"]
+    # Before b's first change: a blocks (use_not_allowed) *and* b blocks
+    # (no_valid_license) — every blocking version is reported with its reason.
+    assert first["allowed"] is False
+    reasons = {(bl["version_id"], bl["reason"]) for bl in first["blockers"]}
+    assert reasons == {("a", "use_not_allowed"), ("b", "no_valid_license")}
+    # After 04-01 only a still blocks.
+    assert second["allowed"] is False
+    assert [(bl["version_id"], bl["reason"]) for bl in second["blockers"]] == [
+        ("a", "use_not_allowed")
+    ]
+
+
+def test_timeline_segments_agree_with_point_checks(client):
+    _register(client, "a")
+    _change(client, "ca1", "a", _iso(2026, 1, 1), ["research", "review"])
+    _change(client, "ca2", "a", _iso(2026, 6, 1), ["research"])
+    _register(client, "d1", ["a"])
+    _change(client, "cd1", "d1", _iso(2026, 2, 1), ["research", "review"])
+
+    body = _timeline(client, "d1", "review", _iso(2026, 1, 15), _iso(2026, 8, 15)).json()
+    segments = body["segments"]
+    # Segments tile the whole interval without gaps or overlaps.
+    assert segments[0]["start"] == body["start"]
+    assert segments[-1]["end"] == body["end"]
+    for left, right in zip(segments, segments[1:]):
+        assert left["end"] == right["start"]
+
+    # Every sampled instant matches the single-instant check contract.
+    samples = [_iso(2026, 1, 20)] + [_iso(2026, month, 10) for month in range(2, 8)]
+    for at in samples:
+        instant = _parse_ts(at)
+        segment = next(
+            s
+            for s in segments
+            if _parse_ts(s["start"]) <= instant < _parse_ts(s["end"])
+        )
+        point = _check(client, "d1", "review", at).json()
+        assert segment["allowed"] == point["allowed"]
+        assert segment["blockers"] == point["blockers"]
+        assert segment["basis"] == point["basis"]
+        assert segment["allowed_uses_intersection"] == point["allowed_uses_intersection"]
+
+
+def test_timeline_unknown_version_is_404(client):
+    resp = _timeline(client, "ghost", "research", _iso(2026, 1, 1), _iso(2026, 2, 1))
+    assert resp.status_code == 404
+    assert resp.json()["error"] == "not_found"
+
+
+def test_timeline_naive_times_are_422(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+
+    naive_start = client.get(
+        "/permissions/timeline",
+        params={
+            "version_id": "v1",
+            "use": "research",
+            "start": "2026-01-01T00:00:00",
+            "end": _iso(2026, 2, 1),
+        },
+    )
+    assert naive_start.status_code == 422
+    assert naive_start.json()["error"] == "invalid_time"
+
+    naive_end = client.get(
+        "/permissions/timeline",
+        params={
+            "version_id": "v1",
+            "use": "research",
+            "start": _iso(2026, 1, 1),
+            "end": "2026-02-01T00:00:00",
+        },
+    )
+    assert naive_end.status_code == 422
+    assert naive_end.json()["error"] == "invalid_time"
+
+
+def test_timeline_inverted_or_empty_interval_is_422(client):
+    _register(client, "v1")
+    _change(client, "c1", "v1", _iso(2026, 1, 1), ["research"])
+
+    inverted = _timeline(client, "v1", "research", _iso(2026, 2, 1), _iso(2026, 1, 1))
+    assert inverted.status_code == 422
+    assert inverted.json()["error"] == "invalid_interval"
+
+    empty = _timeline(client, "v1", "research", _iso(2026, 1, 1), _iso(2026, 1, 1))
+    assert empty.status_code == 422
+    assert empty.json()["error"] == "invalid_interval"
+
+    # The same instant written in two offsets is still an empty interval.
+    same_instant = client.get(
+        "/permissions/timeline",
+        params={
+            "version_id": "v1",
+            "use": "research",
+            "start": "2026-01-01T08:00:00+08:00",
+            "end": "2026-01-01T00:00:00Z",
+        },
+    )
+    assert same_instant.status_code == 422
+    assert same_instant.json()["error"] == "invalid_interval"
+
+
+def test_timeline_empty_use_is_400(client):
+    _register(client, "v1")
+    resp = _timeline(client, "v1", "   ", _iso(2026, 1, 1), _iso(2026, 2, 1))
+    assert resp.status_code == 400
+
+
+def test_timeline_on_demo_seed(tmp_path):
+    db_path = str(tmp_path / "seed3.db")
+    settings = Settings(db_path=db_path, init_db=True, seed_demo=True, echo=False)
+    with TestClient(create_app(settings)) as test_client:
+        body = test_client.get(
+            "/permissions/timeline",
+            params={
+                "version_id": "demo-derived-1",
+                "use": "review",
+                "start": "2026-01-15T00:00:00Z",
+                "end": "2026-07-15T00:00:00Z",
+            },
+        ).json()
+        assert body["closure"] == ["demo-derived-1", "demo-root-a", "demo-root-b"]
+        segments = body["segments"]
+        assert len(segments) == 3
+        # Before the derived version's first change: it has no_valid_license,
+        # and demo-root-b's license already excludes review.
+        assert segments[0]["allowed"] is False
+        first_blockers = {(bl["version_id"], bl["reason"]) for bl in segments[0]["blockers"]}
+        assert first_blockers == {
+            ("demo-derived-1", "no_valid_license"),
+            ("demo-root-b", "use_not_allowed"),
+        }
+        # Then only demo-root-b blocks review ...
+        assert [bl["version_id"] for bl in segments[1]["blockers"]] == ["demo-root-b"]
+        # ... and after root-a's June change both roots block it.
+        assert {bl["version_id"] for bl in segments[2]["blockers"]} == {
+            "demo-root-a",
+            "demo-root-b",
+        }
+        assert all(bl["reason"] == "use_not_allowed" for bl in segments[2]["blockers"])
+
+        # research stays allowed from the derived version's first change on;
+        # root-a's June change still splits the timeline (basis changed).
+        research = test_client.get(
+            "/permissions/timeline",
+            params={
+                "version_id": "demo-derived-1",
+                "use": "research",
+                "start": "2026-01-15T00:00:00Z",
+                "end": "2026-07-15T00:00:00Z",
+            },
+        ).json()
+        assert [s["allowed"] for s in research["segments"]] == [False, True, True]
+        assert research["segments"][1]["allowed_uses_intersection"] == ["research"]
+        assert research["segments"][2]["allowed_uses_intersection"] == ["research"]
+        basis_june = {
+            entry["version_id"]: entry["change_id"]
+            for entry in research["segments"][2]["basis"]
+        }
+        assert basis_june["demo-root-a"] == "demo-chg-a-2"

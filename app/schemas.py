@@ -119,6 +119,36 @@ class PermissionResponse(BaseModel):
     allowed_uses_intersection: list[str] = Field(default_factory=list)
 
 
+class PermissionSegment(BaseModel):
+    """One continuous slice of a permission timeline.
+
+    Within ``[start, end)`` the evaluation is constant: ``basis`` and
+    ``blockers`` are exactly what the single-instant check would report at
+    any instant inside the slice.
+    """
+
+    start: datetime = Field(description="片段起点（含）")
+    end: datetime = Field(description="片段终点（不含）")
+    allowed: bool
+    basis: list[BasisEntry] = Field(default_factory=list, description="片段内各版本所依据的最近变更")
+    blockers: list[BlockerEntry] = Field(default_factory=list, description="片段内全部阻断版本与原因")
+    allowed_uses_intersection: list[str] = Field(default_factory=list)
+
+
+class PermissionTimelineResponse(BaseModel):
+    version_id: str
+    use: str
+    start: datetime = Field(description="区间起点（含）")
+    end: datetime = Field(description="区间终点（不含）")
+    closure: list[str] = Field(description="自身及全部祖先（去重、广度优先）")
+    segments: list[PermissionSegment] = Field(
+        description=(
+            "半开区间 [start, end) 切出的连续、无重叠片段；"
+            "仅在判定依据或阻断信息变化时分段，相邻相同片段已合并"
+        )
+    )
+
+
 class CreateResponse(BaseModel):
     """Response wrapper that reports whether a submission was replayed."""
 

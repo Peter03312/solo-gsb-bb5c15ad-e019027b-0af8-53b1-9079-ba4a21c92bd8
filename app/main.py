@@ -21,6 +21,8 @@ from .schemas import (
     LicenseChangeRequest,
     LicenseChangeResponse,
     PermissionResponse,
+    PermissionSegment,
+    PermissionTimelineResponse,
     PreviewChangeRequest,
     PreviewChangeStub,
     PreviewQuery,
@@ -32,6 +34,19 @@ from .seed import seed_demo_data
 from .service import InvalidTimeError, LicenseService, ServiceError
 
 logger = logging.getLogger("license_service")
+
+
+def _parse_aware_param(raw: str, name: str) -> datetime:
+    """Parse an ISO 8601 query parameter that must carry a timezone."""
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise InvalidTimeError(
+            f"{name} 参数必须是带时区的 ISO 8601 时刻，例如 2026-07-01T00:00:00Z"
+        ) from exc
+    if parsed.tzinfo is None:
+        raise InvalidTimeError(f"{name} 参数必须带时区信息（例如结尾的 Z 或 +00:00）")
+    return parsed
 
 
 class AppState:
@@ -226,14 +241,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         use: str = Query(..., description="拟使用的用途"),
         at: str = Query(..., alias="at", description="UTC 时刻（带时区），如 2026-07-01T00:00:00Z"),
     ) -> PermissionResponse:
-        try:
-            parsed = datetime.fromisoformat(at.replace("Z", "+00:00"))
-        except ValueError as exc:
-            raise InvalidTimeError(
-                "at 参数必须是带时区的 ISO 8601 时刻，例如 2026-07-01T00:00:00Z"
-            ) from exc
-        if parsed.tzinfo is None:
-            raise InvalidTimeError("at 参数必须带时区信息（例如结尾的 Z 或 +00:00）")
+        parsed = _parse_aware_param(at, "at")
         result = service_from(request).check_permission(version_id, use, parsed)
         return PermissionResponse(
             version_id=result["version_id"],
@@ -244,6 +252,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             basis=[BasisEntry(**b) for b in result["basis"]],
             blockers=[BlockerEntry(**b) for b in result["blockers"]],
             allowed_uses_intersection=result["allowed_uses_intersection"],
+        )
+
+    @app.get(
+        "/permissions/timeline",
+        response_model=PermissionTimelineResponse,
+        tags=["permissions"],
+        summary="把半开区间 [start, end) 切成连续、无重叠的许可判定片段",
+        responses={
+            404: {"description": "版本不存在"},
+            422: {"description": "起止时刻缺少时区或无法解析，或区间为空/倒置"},
+        },
+    )
+    def permission_timeline(
+        request: Request,
+        version_id: str = Query(..., description="被查询的数据集版本"),
+        use: str = Query(..., description="拟使用的用途"),
+        start: str = Query(..., description="区间开始时刻（带时区，含），如 2026-01-15T00:00:00Z"),
+        end: str = Query(..., description="区间结束时刻（带时区，不含），如 2026-07-15T00:00:00Z"),
+    ) -> PermissionTimelineResponse:
+        start_dt = _parse_aware_param(start, "start")
+        end_dt = _parse_aware_param(end, "end")
+        result = service_from(request).check_permission_timeline(
+            version_id, use, start_dt, end_dt
+        )
+        return PermissionTimelineResponse(
+            version_id=result["version_id"],
+            use=result["use"],
+            start=result["start"],
+            end=result["end"],
+            closure=result["closure"],
+            segments=[PermissionSegment(**segment) for segment in result["segments"]],
         )
 
     return app

@@ -14,6 +14,15 @@ curl -s "$BASE/permissions/check?version_id=demo-derived-1&use=research&at=2026-
 say "判定示例：2026-07-01 申请 review（被 demo-root-a 阻断）"
 curl -s "$BASE/permissions/check?version_id=demo-derived-1&use=review&at=2026-07-01T00:00:00Z"; echo
 
+say "区间分段：demo-derived-1 的 review 在 2026-01-15 ~ 2026-07-15 的可用片段与阻断原因"
+curl -s "$BASE/permissions/timeline?version_id=demo-derived-1&use=review&start=2026-01-15T00:00:00Z&end=2026-07-15T00:00:00Z"; echo
+
+say "区间分段：同一区间申请 research（2 月 1 日起持续允许，6 月 1 日依据变更仍切分片段）"
+curl -s "$BASE/permissions/timeline?version_id=demo-derived-1&use=research&start=2026-01-15T00:00:00Z&end=2026-07-15T00:00:00Z"; echo
+
+say "区间分段错误：start 不早于 end -> 422 invalid_interval"
+curl -s "$BASE/permissions/timeline?version_id=demo-derived-1&use=research&start=2026-07-15T00:00:00Z&end=2026-01-15T00:00:00Z"; echo
+
 say "登记新派生版本（父版本 demo-root-a）"
 curl -s -X POST "$BASE/versions" -H 'Content-Type: application/json' \
   -d '{"version_id":"example-v1","parent_ids":["demo-root-a"],"note":"调用示例"}'; echo

@@ -75,6 +75,11 @@ class InvalidTimeError(ServiceError):
     code = "invalid_time"
 
 
+class InvalidIntervalError(ServiceError):
+    status_code = 422
+    code = "invalid_interval"
+
+
 # -- serialisation ---------------------------------------------------------
 
 
@@ -338,6 +343,87 @@ class LicenseService:
             "basis": basis,
             "blockers": blockers,
             "allowed_uses_intersection": result_intersection,
+        }
+
+    # -- permission timeline (interval segmentation) ----------------------
+
+    def check_permission_timeline(
+        self,
+        version_id: str,
+        use: str,
+        start: datetime,
+        end: datetime,
+    ) -> dict[str, Any]:
+        """Slice the half-open interval ``[start, end)`` into permission segments.
+
+        All reads come from one pinned snapshot (the same mechanism as the
+        change preview), so the ancestor closure and every change seen here
+        belong to a single consistent view. Segment boundaries are the
+        effective instants of the closure's changes strictly inside the
+        interval; a change exactly at ``start`` applies from the first
+        segment on, a change exactly at ``end`` is not counted. Segments are
+        only split where the basis or the blocking information changes —
+        adjacent identical segments are merged.
+        """
+        if start.tzinfo is None or end.tzinfo is None:
+            raise InvalidTimeError("起止时刻必须带时区信息")
+        use = use.strip()
+        if not use:
+            raise ServiceError("用途不能为空")
+
+        start_utc = start.astimezone(timezone.utc)
+        end_utc = end.astimezone(timezone.utc)
+        if not start_utc < end_utc:
+            raise InvalidIntervalError(
+                "开始时刻必须严格早于结束时刻（半开区间 [start, end) 不能为空或倒置）",
+                {
+                    "start": to_canonical(start_utc),
+                    "end": to_canonical(end_utc),
+                },
+            )
+
+        with self.db.lock:
+            snapshot = self._capture_snapshot()
+        if version_id not in snapshot.versions:
+            raise NotFoundError("版本不存在", {"version_id": version_id})
+
+        start_c = to_canonical(start_utc)
+        end_c = to_canonical(end_utc)
+        closure = snapshot.closure_from(version_id)
+
+        interior: set[str] = set()
+        for vid in closure:
+            for change in snapshot.changes.get(vid, ()):
+                if start_c < change.effective_at < end_c:
+                    interior.add(change.effective_at)
+        edges = [start_c, *sorted(interior), end_c]
+
+        segments: list[dict[str, Any]] = []
+        open_segment: tuple[tuple[Any, ...], dict[str, Any], str] | None = None
+        for index in range(len(edges) - 1):
+            seg_start = edges[index]
+            # The state is constant within [seg_start, next edge): only a
+            # change can alter it, and every in-interval change is an edge.
+            state = _evaluate(snapshot, version_id, use, seg_start, None)
+            key = _segment_state_key(state)
+            if open_segment is not None and open_segment[0] == key:
+                # Identical basis and blockers: extend the previous segment.
+                continue
+            if open_segment is not None:
+                segments.append(
+                    _segment_payload(open_segment[2], seg_start, open_segment[1])
+                )
+            open_segment = (key, state, seg_start)
+        assert open_segment is not None  # start < end guarantees >= 1 segment
+        segments.append(_segment_payload(open_segment[2], end_c, open_segment[1]))
+
+        return {
+            "version_id": version_id,
+            "use": use,
+            "start": start_utc,
+            "end": end_utc,
+            "closure": closure,
+            "segments": segments,
         }
 
     # -- change preview (no writes) ---------------------------------------
@@ -634,4 +720,50 @@ def _evaluate(
         "basis": basis,
         "blockers": blockers,
         "allowed_uses_intersection": result_intersection,
+    }
+
+
+def _segment_state_key(state: dict[str, Any]) -> tuple[Any, ...]:
+    """Hashable identity of a segment: allowed flag, basis and blockers.
+
+    Two adjacent slices with equal keys carry the same 判定依据 and 阻断信息
+    and must be merged into one continuous segment.
+    """
+    basis_key = tuple(
+        (
+            entry["version_id"],
+            entry["change_id"],
+            to_canonical(entry["effective_at"]),
+            tuple(entry["allowed_uses"]),
+        )
+        for entry in state["basis"]
+    )
+    blocker_key = tuple(
+        (
+            entry["version_id"],
+            entry["reason"],
+            entry.get("change_id"),
+            to_canonical(entry["effective_at"])
+            if entry.get("effective_at") is not None
+            else None,
+            tuple(entry.get("allowed_uses", ())),
+        )
+        for entry in state["blockers"]
+    )
+    return (
+        state["allowed"],
+        basis_key,
+        blocker_key,
+        tuple(state["allowed_uses_intersection"]),
+    )
+
+
+def _segment_payload(start_c: str, end_c: str, state: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "start": parse_canonical(start_c),
+        "end": parse_canonical(end_c),
+        "allowed": state["allowed"],
+        "basis": state["basis"],
+        "blockers": state["blockers"],
+        "allowed_uses_intersection": state["allowed_uses_intersection"],
     }

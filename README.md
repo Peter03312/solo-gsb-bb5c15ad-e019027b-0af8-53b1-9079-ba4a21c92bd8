@@ -12,6 +12,7 @@
   3. 对各版本的允许用途取**交集**；
   4. **任一版本在该时刻没有有效许可，或其有效许可不包含所申请用途，即拒绝**；
   5. 响应返回：`allowed` 可否使用、`basis` 各版本所依据的变更、`blockers` 所有阻断版本（含原因）、`allowed_uses_intersection` 交集。
+- **区间分段判定（排期）**：查询「给定版本 + 用途 + 带时区的起止时刻（开始严格早于结束）」时，服务在**一次一致数据视图**中展开自身及全部祖先，把半开区间 **[start, end)** 切成连续、无重叠的片段：分段点取自闭包内各版本变更的生效时刻，**起点恰逢变更立即采用新许可、终点上的变更不计入**；无有效许可的时段持续拒绝；菱形祖先只算一次；**仅在判定依据或阻断信息变化时分段**，相邻相同片段自动合并。每段返回起止、`allowed`、`basis`、全部 `blockers`（含原因）与用途交集，任一参数非法（未知版本、无时区、区间倒置或为空）都明确报错且不返回部分结果。
 - **变更预演（不写入）**：提交变更前可经 `POST /license-changes/preview` 预演其对目标版本及全部后代的影响；同一数据快照下分别计算现状与假设提交后的判定，仅返回允许状态翻转的版本（含前后判定与阻断原因），菱形继承的后代只计一次；查询早于生效时刻、或已有更晚有效变更覆盖时结果为空且绝不误报；预演不写入任何数据，冲突/幂等语义与提交接口一致。
 - **幂等与冲突**：
   - 相同**变更标识**且语义内容（版本、生效时刻、允许用途集合；用途顺序/重复不影响）完全相同的重复提交，返回**同一结果**（HTTP `200`，`replayed=true`）；
@@ -156,7 +157,75 @@ curl -s "http://localhost:8000/permissions/check?version_id=demo-derived-1&use=r
 # -> allowed=false, blockers 含 demo-root-a / use_not_allowed
 ```
 
-### 4. 预演许可变更（提交前影响分析，不写入）
+### 4. 区间分段判定（本轮入口，排期用）
+
+`GET /permissions/timeline?version_id=...&use=...&start=...&end=...`
+
+回答「某用途在一段时期内**何时可用、为何中断**」：服务在一次一致数据视图中沿固定父引用展开自身及全部祖先（菱形去重），按各版本当时最近生效的许可变更与用途交集，把半开区间 **[start, end)** 切成连续、无重叠的片段。分段点只取自闭包内各版本变更的生效时刻；**仅在判定依据（basis）或阻断信息（blockers）变化时分段**，相邻相同片段自动合并。
+
+- 起点恰好有变更：立即采用新许可（与单时刻判定 `effective_at <= at` 同口径）；
+- 终点上的变更**不计入**（半开区间）；
+- 某时段内任一祖先无有效许可 → 该片段持续拒绝，`blockers` 给出 `no_valid_license`；
+- 每个片段返回 `start` / `end`、`allowed`、`basis`（各版本依据的变更）、`blockers`（全部阻断版本与原因）、`allowed_uses_intersection`。
+
+```bash
+curl -s "http://localhost:8000/permissions/timeline?version_id=demo-derived-1&use=review&start=2026-01-15T00:00:00Z&end=2026-07-15T00:00:00Z"
+```
+
+基于内置示例数据的响应（`basis` 字段从略，形状同单时刻判定）：
+
+```json
+{
+  "version_id": "demo-derived-1",
+  "use": "review",
+  "start": "2026-01-15T00:00:00Z",
+  "end": "2026-07-15T00:00:00Z",
+  "closure": ["demo-derived-1", "demo-root-a", "demo-root-b"],
+  "segments": [
+    {
+      "start": "2026-01-15T00:00:00Z",
+      "end": "2026-02-01T00:00:00Z",
+      "allowed": false,
+      "blockers": [
+        { "version_id": "demo-derived-1", "reason": "no_valid_license" },
+        { "version_id": "demo-root-b", "reason": "use_not_allowed", "change_id": "demo-chg-b-1" }
+      ],
+      "allowed_uses_intersection": []
+    },
+    {
+      "start": "2026-02-01T00:00:00Z",
+      "end": "2026-06-01T00:00:00Z",
+      "allowed": false,
+      "blockers": [
+        { "version_id": "demo-root-b", "reason": "use_not_allowed", "change_id": "demo-chg-b-1" }
+      ],
+      "allowed_uses_intersection": ["research"]
+    },
+    {
+      "start": "2026-06-01T00:00:00Z",
+      "end": "2026-07-15T00:00:00Z",
+      "allowed": false,
+      "blockers": [
+        { "version_id": "demo-root-a", "reason": "use_not_allowed", "change_id": "demo-chg-a-2" },
+        { "version_id": "demo-root-b", "reason": "use_not_allowed", "change_id": "demo-chg-b-1" }
+      ],
+      "allowed_uses_intersection": ["research"]
+    }
+  ]
+}
+```
+
+即：review 在 2 月 1 日前因派生版本尚无许可且 root-b 不含 review 被拒；2 月 1 日起仅剩 root-b 阻断；6 月 1 日 root-a 收紧后两个根版本共同阻断。换成 `use=research` 则第 2、3 段均为 `allowed=true`（6 月 1 日 root-a 的依据变更仍会切分片段，因为判定依据变了）。
+
+错误语义（一律不返回部分结果）：
+
+| 情形 | 结果 |
+| --- | --- |
+| 版本不存在 | `404 not_found` |
+| `start` / `end` 无时区或无法解析 | `422 invalid_time` |
+| `start >= end`（倒置或空区间；同一时刻的两种时区写法也算空区间） | `422 invalid_interval` |
+
+### 5. 预演许可变更（提交前影响分析，不写入）
 
 `POST /license-changes/preview`
 
@@ -201,7 +270,7 @@ curl -s -X POST http://localhost:8000/license-changes/preview \
 
 并发说明：预演在单个 SQLite WAL 只读快照事务内、并在进程级锁保护下一次性读取版本、父引用与变更，评估过程中其他请求的提交不会混入，不会出现「版本来自旧快照、变更来自新快照」的拼接结果。
 
-### 5. 查询接口
+### 6. 查询接口
 
 | 方法与路径 | 说明 |
 | --- | --- |
@@ -246,4 +315,4 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-测试覆盖：父引用存在性与不可变、祖先展开（含菱形去重）、用途交集、无有效许可阻断、最近变更生效、幂等重放、两类 409 冲突、时区校验、示例数据初始化，以及变更预演（目标与后代翻转、查询早于生效时刻/更晚变更覆盖不误报、重放无影响、冲突与 404 错误语义、菱形后代只计一次、预演不写入、并发提交下快照不混用）。
+测试覆盖：父引用存在性与不可变、祖先展开（含菱形去重）、用途交集、无有效许可阻断、最近变更生效、幂等重放、两类 409 冲突、时区校验、示例数据初始化，变更预演（目标与后代翻转、查询早于生效时刻/更晚变更覆盖不误报、重放无影响、冲突与 404 错误语义、菱形后代只计一次、预演不写入、并发提交下快照不混用），以及区间分段判定（变更边界切分、起点变更立即生效/终点变更不计入、无有效许可持续拒绝、菱形闭包去重、每段全部阻断版本与原因、与单时刻判定逐点一致、未知版本 404、无时区与倒置/空区间 422）。
